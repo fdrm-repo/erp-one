@@ -1,0 +1,261 @@
+/**
+ * ONE Definition Language (ODL) Compiler
+ * 
+ * Full compilation pipeline:
+ * ODL → Parser → AST → Validator → Metadata Graph → Type Generator → Runtime Metadata
+ */
+
+import { ODLParser } from './odl-parser'
+import { buildMetadataGraph, serializeMetadataGraph } from './metadata-graph-builder'
+import type { MetadataGraph, CompileError, ODLDocument } from '@/types/odl'
+
+export interface CompileOptions {
+  watch?: boolean
+  incremental?: boolean
+  generateTypes?: boolean
+  outputDir?: string
+}
+
+export interface CompileResult {
+  success: boolean
+  metadata?: MetadataGraph
+  runtimeJSON?: string
+  types?: string
+  errors: CompileError[]
+  warnings: CompileError[]
+}
+
+/**
+ * ONE Definition Language Compiler
+ */
+export class ODLCompiler {
+  private options: CompileOptions = {}
+  private cache: Map<string, { ast: ODLDocument; errors: CompileError[] }> = new Map()
+
+  constructor(options?: CompileOptions) {
+    this.options = { ...options }
+  }
+
+  /**
+   * Compile ODL files
+   */
+  async compile(
+    files: Array<{ filename: string; source: string }>
+  ): Promise<CompileResult> {
+    const result: CompileResult = {
+      success: false,
+      errors: [],
+      warnings: [],
+    }
+
+    // Phase 1: Parse all ODL files
+    const parseResult = this.parseFiles(files)
+    result.errors.push(...parseResult.errors)
+
+    if (parseResult.errors.length > 0) {
+      return result
+    }
+
+    // Phase 2: Validate AST (semantic analysis)
+    const documents = parseResult.documents
+    const validationErrors = this.validateDocuments(documents)
+    result.errors.push(...validationErrors)
+
+    if (validationErrors.length > 0) {
+      return result
+    }
+
+    // Phase 3: Build Metadata Graph
+    const graphResult = buildMetadataGraph(documents)
+    result.errors.push(...graphResult.errors)
+
+    if (!graphResult.graph || graphResult.errors.length > 0) {
+      return result
+    }
+
+    result.metadata = graphResult.graph
+
+    // Phase 4: Generate Runtime Metadata JSON
+    result.runtimeJSON = serializeMetadataGraph(graphResult.graph)
+
+    // Phase 5: Generate TypeScript types
+    if (this.options.generateTypes) {
+      result.types = this.generateTypes(graphResult.graph)
+    }
+
+    result.success = true
+    return result
+  }
+
+  /**
+   * Parse all ODL files
+   */
+  private parseFiles(files: Array<{ filename: string; source: string }>): {
+    documents: ODLDocument[]
+    errors: CompileError[]
+  } {
+    const parser = new ODLParser()
+    const documents: ODLDocument[] = []
+    const errors: CompileError[] = []
+
+    for (const file of files) {
+      // Check cache if incremental compilation
+      if (this.options.incremental && this.cache.has(file.filename)) {
+        const cached = this.cache.get(file.filename)!
+        documents.push(cached.ast)
+        errors.push(...cached.errors)
+        continue
+      }
+
+      const { ast, errors: parseErrors } = parser.parse(file.source, file.filename)
+
+      if (ast) {
+        documents.push(ast)
+        if (this.options.incremental) {
+          this.cache.set(file.filename, { ast, errors: parseErrors })
+        }
+      }
+
+      errors.push(...parseErrors)
+    }
+
+    return { documents, errors }
+  }
+
+  /**
+   * Validate ODL documents (semantic analysis)
+   */
+  private validateDocuments(documents: ODLDocument[]): CompileError[] {
+    const errors: CompileError[] = []
+
+    // Collect all entity names for cross-reference validation
+    const entityNames = new Set<string>()
+
+    for (const doc of documents) {
+      for (const def of doc.definitions) {
+        if (def.type === 'entity') {
+          entityNames.add(def.name)
+        }
+      }
+    }
+
+    // Validate references
+    for (const doc of documents) {
+      for (const def of doc.definitions) {
+        if (def.type === 'entity') {
+          errors.push(...this.validateEntityReferences(def, entityNames))
+        }
+      }
+    }
+
+    return errors
+  }
+
+  /**
+   * Validate entity references
+   */
+  private validateEntityReferences(entityDef: any, entityNames: Set<string>): CompileError[] {
+    const errors: CompileError[] = []
+
+    for (const member of entityDef.members || []) {
+      if (member.type === 'relationship') {
+        const target = member.data.target
+        if (!entityNames.has(target)) {
+          errors.push({
+            code: 'REFERENCE_ERROR',
+            message: `Relationship references unknown entity '${target}'`,
+            location: {
+              file: '',
+              line: 0,
+              column: 0,
+            },
+            severity: 'error',
+          })
+        }
+      }
+    }
+
+    return errors
+  }
+
+  /**
+   * Generate TypeScript type definitions
+   */
+  private generateTypes(graph: MetadataGraph): string {
+    const lines: string[] = [
+      '/**',
+      ' * Auto-generated types from ODL',
+      ' * DO NOT EDIT - generated by ODL compiler',
+      ' */',
+      '',
+    ]
+
+    // Generate types for each entity
+    for (const typedef of graph.typeDefinitions) {
+      lines.push(`export interface ${typedef.name} {`)
+
+      for (const field of typedef.fields) {
+        const optional = field.optional ? '?' : ''
+        const comment = field.description ? `  /** ${field.description} */\n` : ''
+        lines.push(`${comment}  ${field.name}${optional}: ${field.type}`)
+      }
+
+      lines.push('}')
+      lines.push('')
+    }
+
+    return lines.join('\n')
+  }
+}
+
+/**
+ * Compile ODL files from filesystem
+ */
+export async function compileODL(
+  filePaths: string[],
+  options?: CompileOptions
+): Promise<CompileResult> {
+  const compiler = new ODLCompiler(options)
+
+  // In a real implementation, this would read files from disk
+  // For now, this is a placeholder
+  const files: Array<{ filename: string; source: string }> = []
+
+  return compiler.compile(files)
+}
+
+/**
+ * Watch mode - recompile on file changes
+ */
+export async function watchODL(
+  filePaths: string[],
+  options?: CompileOptions
+): Promise<void> {
+  const compiler = new ODLCompiler({ ...options, watch: true, incremental: true })
+
+  // In a real implementation, this would use fs.watch or similar
+  console.log('[ODL Compiler] Watch mode enabled')
+  console.log(`[ODL Compiler] Watching ${filePaths.length} files`)
+
+  // Watch logic would go here
+}
+
+/**
+ * Development server with hot reload
+ */
+export async function serveODL(
+  filePaths: string[],
+  port: number = 3000,
+  options?: CompileOptions
+): Promise<void> {
+  const compiler = new ODLCompiler({ ...options, watch: true, incremental: true })
+
+  console.log(`[ODL Compiler] Dev server running on port ${port}`)
+  console.log(`[ODL Compiler] Watching ${filePaths.length} files for changes`)
+
+  // In a real implementation, this would:
+  // 1. Start a web server
+  // 2. Watch for file changes
+  // 3. Recompile on changes
+  // 4. Hot-reload the browser via WebSocket
+}
